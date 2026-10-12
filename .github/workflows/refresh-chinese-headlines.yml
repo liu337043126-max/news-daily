@@ -18,7 +18,7 @@ jobs:
           python-version: '3.11'
 
       - name: 安装依赖
-        run: pip install feedparser
+        run: pip install feedparser argostranslate==1.11.0
 
       - name: 抓取并翻译标题
         run: python fetch_news.py
