@@ -66,6 +66,7 @@ def build_message(items, data):
         lines.append(article["url"])
     repo = os.getenv("GITHUB_REPOSITORY", "xiaochen00111/news-daily")
     branch = os.getenv("GITHUB_REF_NAME", "main")
+    lines.append("标题为机器翻译，具体内容以原文为准。")
     lines.append(f"完整列表：https://github.com/{repo}/blob/{branch}/news.md")
     return "\n".join(lines)
 
