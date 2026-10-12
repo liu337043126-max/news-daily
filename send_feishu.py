@@ -63,6 +63,7 @@ def build_message(items, data):
     lines = [f"财经新闻速递｜{updated}", f"本轮新增标题（展示前 {len(items)} 条）："]
     for number, (source, article) in enumerate(items, 1):
         lines.append(f"{number}. 【{source}】{article['title']}")
+        lines.append(f"原文：{article['title_original']}")
         lines.append(article["url"])
     repo = os.getenv("GITHUB_REPOSITORY", "xiaochen00111/news-daily")
     branch = os.getenv("GITHUB_REF_NAME", "main")
