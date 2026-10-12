@@ -229,6 +229,7 @@ def generate_markdown(all_data):
             title = a["title"].strip()
             url = a["url"]
             lines.append(f"{i}. [{title}]({url})")
+            lines.append(f"   原文：{a['title_original']}")
         lines.append("")
 
     lines.append("---")
