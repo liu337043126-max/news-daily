@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Fetch headlines, translate them to Chinese, and publish a daily digest."""
 import feedparser
+import hashlib
 import json
+import os
 import time
+from urllib.error import HTTPError
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
@@ -58,6 +61,9 @@ SOURCES = {
 OUTPUT_DIR = Path(__file__).parent
 MAX_ARTICLES = 15  # 每个源最多取多少条
 TRANSLATE_BATCH_SIZE = 10
+ARGOS_MODEL_URL = "https://argos-net.com/v1/translate-en_zh-1_9.argosmodel"
+ARGOS_MODEL_SHA256 = "433e7c4f034d87fbe2353161e05f18646d7999452f801a4e1f0378522b9850ab"
+REMOTE_TRANSLATION_AVAILABLE = True
 
 
 def clean_title(title, source_name, extra_suffixes=()):
@@ -82,9 +88,44 @@ def translation_cache(path):
         if article.get("title_original") and article.get("title")
     }
 
+def translate_offline(titles):
+    """Use a pinned English-to-Chinese model when the public API is rate-limited."""
+    import argostranslate.package
+    import argostranslate.translate
+
+    languages = argostranslate.translate.get_installed_languages()
+    english = next((lang for lang in languages if lang.code == "en"), None)
+    chinese = next((lang for lang in languages if lang.code == "zh"), None)
+    if english is None or chinese is None or english.get_translation(chinese) is None:
+        model_path = Path.home() / ".cache" / "news-daily" / "translate-en_zh-1_9.argosmodel"
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        if not model_path.exists() or hashlib.sha256(model_path.read_bytes()).hexdigest() != ARGOS_MODEL_SHA256:
+            request = Request(ARGOS_MODEL_URL, headers={"User-Agent": "news-daily/1.0"})
+            temporary_path = model_path.with_suffix(".download")
+            digest = hashlib.sha256()
+            try:
+                with urlopen(request, timeout=90) as response, open(temporary_path, "wb") as output:
+                    while chunk := response.read(1024 * 1024):
+                        output.write(chunk)
+                        digest.update(chunk)
+                if digest.hexdigest() != ARGOS_MODEL_SHA256:
+                    raise RuntimeError("离线翻译模型校验失败")
+                os.replace(temporary_path, model_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+        argostranslate.package.install_from_path(model_path)
+
+    translated = [argostranslate.translate.translate(title, "en", "zh").strip() for title in titles]
+    if not all(translated):
+        raise RuntimeError("离线翻译返回空标题；未发布英文标题")
+    return translated
+
 
 def translate_batch(titles):
-    """Translate a batch while keeping each result aligned with its original."""
+    """Prefer the public API, falling back to a local model when unavailable."""
+    global REMOTE_TRANSLATION_AVAILABLE
+    if not REMOTE_TRANSLATION_AVAILABLE:
+        return translate_offline(titles)
     query = urlencode({
         "client": "gtx", "sl": "auto", "tl": "zh-CN", "dt": "t",
         "q": "\n".join(titles),
@@ -93,6 +134,7 @@ def translate_batch(titles):
         f"https://translate.googleapis.com/translate_a/single?{query}",
         headers={"User-Agent": "news-daily/1.0"},
     )
+    last_error = None
     for attempt in range(3):
         try:
             with urlopen(request, timeout=20) as response:
@@ -103,9 +145,15 @@ def translate_batch(titles):
                 raise ValueError("translation count does not match headline count")
             return translated
         except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
+            last_error = error
+            if isinstance(error, HTTPError) and error.code == 429:
+                break
             if attempt == 2:
-                raise RuntimeError(f"标题翻译失败；未发布英文标题：{error}") from error
+                break
             time.sleep(2 ** attempt)
+    REMOTE_TRANSLATION_AVAILABLE = False
+    print(f"  在线翻译不可用（{last_error}），改用离线模型")
+    return translate_offline(titles)
 
 
 def translate_articles(all_data, cache):
