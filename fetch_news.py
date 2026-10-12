@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""
-每日抓取路透社、彭博社、华尔街日报头条
-通过 Google News RSS 聚合（从 GitHub Actions 美国服务器运行）
-"""
+"""Fetch headlines, translate them to Chinese, and publish a daily digest."""
 import feedparser
 import json
-import hashlib
-import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 # ========== 新闻源配置 ==========
 SOURCES = {
@@ -20,11 +18,13 @@ SOURCES = {
     "bloomberg": {
         "name": "Bloomberg",
         "name_cn": "彭博社",
+        "title_suffixes": ["Bloomberg.com"],
         "rss": "https://news.google.com/rss/search?q=site:bloomberg.com&hl=en-US&gl=US&ceid=US:en",
     },
     "wsj": {
         "name": "Wall Street Journal",
         "name_cn": "华尔街日报",
+        "title_suffixes": ["WSJ", "The Wall Street Journal"],
         "rss": "https://news.google.com/rss/search?q=site:wsj.com&hl=en-US&gl=US&ceid=US:en",
     },
     "ft": {
@@ -50,12 +50,83 @@ SOURCES = {
     "yahoofinance": {
         "name": "Yahoo Finance",
         "name_cn": "雅虎财经",
+        "title_suffixes": ["Yahoo Finance Australia"],
         "rss": "https://news.google.com/rss/search?q=site:finance.yahoo.com&hl=en-US&gl=US&ceid=US:en",
     },
 }
 
 OUTPUT_DIR = Path(__file__).parent
 MAX_ARTICLES = 15  # 每个源最多取多少条
+TRANSLATE_BATCH_SIZE = 10
+
+
+def clean_title(title, source_name, extra_suffixes=()):
+    """Remove Google News' publisher suffix without cutting a headline's own dash."""
+    title = " ".join(title.split())
+    for publisher in (source_name, *extra_suffixes):
+        suffix = f" - {publisher}"
+        if title.endswith(suffix):
+            return title[:-len(suffix)].strip()
+    return title
+
+
+def translation_cache(path):
+    """Reuse translations from the last successful run."""
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        article["title_original"]: article["title"]
+        for source in data.get("sources", {}).values()
+        for article in source.get("articles", [])
+        if article.get("title_original") and article.get("title")
+    }
+
+
+def translate_batch(titles):
+    """Translate a batch while keeping each result aligned with its original."""
+    query = urlencode({
+        "client": "gtx", "sl": "auto", "tl": "zh-CN", "dt": "t",
+        "q": "\n".join(titles),
+    })
+    request = Request(
+        f"https://translate.googleapis.com/translate_a/single?{query}",
+        headers={"User-Agent": "news-daily/1.0"},
+    )
+    for attempt in range(3):
+        try:
+            with urlopen(request, timeout=20) as response:
+                segments = json.load(response)[0]
+            translated = "".join(segment[0] for segment in segments).splitlines()
+            translated = [title.strip() for title in translated]
+            if len(translated) != len(titles) or not all(translated):
+                raise ValueError("translation count does not match headline count")
+            return translated
+        except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
+            if attempt == 2:
+                raise RuntimeError(f"标题翻译失败；未发布英文标题：{error}") from error
+            time.sleep(2 ** attempt)
+
+
+def translate_articles(all_data, cache):
+    reused = sum(
+        article["title_original"] in cache
+        for articles in all_data.values()
+        for article in articles
+    )
+    pending = list(dict.fromkeys(
+        article["title_original"]
+        for articles in all_data.values()
+        for article in articles
+        if article["title_original"] and article["title_original"] not in cache
+    ))
+    for start in range(0, len(pending), TRANSLATE_BATCH_SIZE):
+        titles = pending[start:start + TRANSLATE_BATCH_SIZE]
+        cache.update(zip(titles, translate_batch(titles)))
+    for articles in all_data.values():
+        for article in articles:
+            article["title"] = cache.get(article["title_original"], "")
+    print(f"  已翻译 {len(pending)} 个新标题，复用 {reused} 条历史译文")
 
 
 def fetch_source(key, config):
@@ -65,8 +136,11 @@ def fetch_source(key, config):
         feed = feedparser.parse(config["rss"])
         articles = []
         for entry in feed.entries[:MAX_ARTICLES]:
+            original = clean_title(
+                entry.get("title", ""), config["name"], config.get("title_suffixes", ())
+            )
             articles.append({
-                "title": entry.get("title", ""),
+                "title_original": original,
                 "url": entry.get("link", ""),
                 "published": entry.get("published", ""),
                 "summary": entry.get("summary", ""),
@@ -86,6 +160,7 @@ def generate_markdown(all_data):
         f"**更新时间：{now}**",
         "",
         "> 来源：路透社 (Reuters) · 彭博社 (Bloomberg) · 华尔街日报 (WSJ)",
+        "> 标题为机器翻译，具体内容以原文为准。",
         "",
         "---",
         "",
@@ -104,8 +179,6 @@ def generate_markdown(all_data):
             continue
         for i, a in enumerate(articles, 1):
             title = a["title"].strip()
-            # 去掉 Google News 加的后缀
-            title = title.split(" - ")[0].strip()
             url = a["url"]
             lines.append(f"{i}. [{title}]({url})")
         lines.append("")
@@ -123,6 +196,8 @@ def main():
     for key, config in SOURCES.items():
         articles = fetch_source(key, config)
         all_data[key] = articles
+
+    translate_articles(all_data, translation_cache(OUTPUT_DIR / "news.json"))
 
     # 保存 JSON
     json_path = OUTPUT_DIR / "news.json"
