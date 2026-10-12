@@ -16,6 +16,9 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      - name: 保存上次新闻
+        run: cp news.json previous-news.json
+
       - name: 安装 Python
         uses: actions/setup-python@v5
         with:
@@ -26,6 +29,12 @@ jobs:
 
       - name: 抓取新闻
         run: python fetch_news.py
+
+      - name: 推送新增标题到飞书
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SIGNING_SECRET: ${{ secrets.FEISHU_SIGNING_SECRET }}
+        run: python send_feishu.py
 
       - name: 提交更新
         run: |
